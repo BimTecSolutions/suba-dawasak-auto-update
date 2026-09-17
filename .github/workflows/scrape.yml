@@ -1,0 +1,56 @@
+name: Suba Dawasak — Incremental Update
+
+on:
+  schedule:
+    # GitHub's minimum cron interval is 1 minute, but schedules are only
+    # "best effort" and can be delayed under load — 5 minutes is close to
+    # the practical minimum you can rely on.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+
+# Prevents two runs from overlapping if one run takes longer than 5 minutes
+concurrency:
+  group: suba-dawasak-scraper
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set up Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Write Firebase service account key
+        run: echo "$FIREBASE_SERVICE_ACCOUNT" > serviceAccountKey.json
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+      - name: Run scraper
+        run: python main.py
+        env:
+          FIREBASE_CREDENTIALS: serviceAccountKey.json
+          # Tune these if you like — sensible defaults are already in main.py
+          # START_DRAW_FALLBACK: "1"
+          # MAX_CONSECUTIVE_MISSES: "3"
+          # MAX_NEW_DRAWS_PER_RUN: "20"
+          # DRAW_DELAY_SECONDS: "1.0"
+
+      - name: Clean up credentials file
+        if: always()
+        run: rm -f serviceAccountKey.json
