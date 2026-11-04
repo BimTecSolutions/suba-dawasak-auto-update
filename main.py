@@ -1,33 +1,37 @@
 """
-Suba Dawasak — incremental Firestore updater (low-usage version).
+Suba Dawasak — GitHub Actions updater (built for a 5-minute schedule).
 
 Firestore cost per run:
   * Nothing new published : 1 read, 0 writes
-  * N new draws           : 1 read, 2*N writes (result doc + 1 small meta update)
+  * Each new draw         : 1 write (create(); never overwrites existing data)
 
-How it keeps usage low:
-  * The latest draw number is kept in ONE small "meta" field on the parent
-    document (NLB_Results_All/suba-dawasak). Each run reads only that.
-    If the field is missing (first run) it falls back to a single
-    order_by query once, then saves the value for next time.
-  * Result + meta are written together in one atomic batch.
-  * Cheap HTTP check first; headless Chrome starts only if really needed
-    (a clean 404 for an unpublished draw never starts Chrome).
-  * In steady state it only probes the next 1-2 draw numbers.
+Efficiency:
+  * No meta document and no "exists?" reads: the latest draw number comes from
+    ONE ordered query (limit 1), which can never go stale.
+  * The URL style (padded vs not, which host) is copied from the latest stored
+    document, so a normal run requests ONE page per draw number.
+  * Plain HTTP first. A clean 404 (not published) never starts Chrome.
+    Chrome is capped at MAX_SELENIUM_FETCHES page loads per run.
+  * Stops after MAX_CONSECUTIVE_MISSES unpublished draws in a row.
 
-Environment variables:
-  FIREBASE_CREDENTIALS     Service account JSON path. Default: serviceAccountKey.json
-  START_DRAW_FALLBACK      Start draw if Firestore is empty. Default: 1
-  MAX_CONSECUTIVE_MISSES   Stop after this many misses in a row. Default: 2
-  MAX_NEW_DRAWS_PER_RUN    Safety cap per run. Default: 60
-  DRAW_DELAY_SECONDS       Delay between draws. Default: 1.0
-  DEBUG                    1 = print page text when parsing fails.
+Date/number parsing is the same as your working backfill script:
+the draw date is taken ONLY from an explicit "Date"/"Draw Date" label and
+stored like "November 3, 2026" (+ date_iso "2026-11-03T00:00:00").
+
+Environment variables (all optional):
+  GOOGLE_APPLICATION_CREDENTIALS or FIREBASE_CREDENTIALS   service account JSON path
+  START_DRAW_FALLBACK      first draw if Firestore is empty. Default: 1
+  MAX_CONSECUTIVE_MISSES   Default: 2
+  MAX_NEW_DRAWS_PER_RUN    Default: 20
+  MAX_SELENIUM_FETCHES     Default: 3
+  ALL_URL_VARIANTS         1 = try every URL variant (slower). Default: 0
+  DEBUG                    1 = print page text when parsing fails
 """
 
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 
 import requests
@@ -35,9 +39,10 @@ from bs4 import BeautifulSoup
 
 import firebase_admin
 from firebase_admin import credentials, firestore
+from google.api_core.exceptions import AlreadyExists
 
 
-class SubaDawasakScraper:
+class SubaDawasakUpdater:
     BASE_URLS = ["https://www.nlb.lk", "https://r.nlb.lk"]
 
     LOTTERY_SLUG = "suba-dawasak"
@@ -48,7 +53,6 @@ class SubaDawasakScraper:
     FIRESTORE_SUBCOLLECTION = "results"
 
     HTTP_TIMEOUT = 20
-    SELENIUM_ATTEMPTS = 2
     PAGE_WAIT = 4
 
     ZODIAC_SIGNS = [
@@ -57,11 +61,20 @@ class SubaDawasakScraper:
         "AQUARIUS", "PISCES",
     ]
 
-    def __init__(self, firebase_creds_path: str, debug: bool = False):
-        self.db = None
-        self.driver = None
+    def __init__(
+        self,
+        creds_path: str,
+        debug: bool = False,
+        max_selenium_fetches: int = 3,
+        all_url_variants: bool = False,
+    ):
         self.debug = debug
-        self.latest_known: Optional[int] = None
+        self.max_selenium_fetches = max_selenium_fetches
+        self.all_url_variants = all_url_variants
+        self.selenium_fetches = 0
+        self.driver = None
+        self.url_base: Optional[str] = None      # learned from latest stored doc
+        self.url_padded: bool = True
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -79,35 +92,23 @@ class SubaDawasakScraper:
             "Connection": "keep-alive",
         })
 
-        self.init_firebase(firebase_creds_path)
-
-    # ------------------------------------------------------------
-    # FIREBASE
-    # ------------------------------------------------------------
-    def init_firebase(self, creds_path: str):
         if not firebase_admin._apps:
             firebase_admin.initialize_app(credentials.Certificate(creds_path))
         self.db = firestore.client()
         print("✅ Firebase initialized.")
 
-    def meta_ref(self):
+    # ------------------------------------------------------------
+    # FIREBASE
+    # ------------------------------------------------------------
+    def results_collection(self):
         return (
             self.db.collection(self.FIRESTORE_COLLECTION)
             .document(self.FIRESTORE_DOCUMENT)
+            .collection(self.FIRESTORE_SUBCOLLECTION)
         )
 
-    def results_collection(self):
-        return self.meta_ref().collection(self.FIRESTORE_SUBCOLLECTION)
-
     def get_latest_draw_number(self) -> Optional[int]:
-        """1 read normally. Falls back to a 1-doc query only if meta is missing."""
-        snap = self.meta_ref().get()
-        if snap.exists:
-            value = (snap.to_dict() or {}).get("latest_draw_number")
-            if isinstance(value, int):
-                return value
-
-        print("ℹ️ No meta field yet — one-time lookup of the latest draw.")
+        """ONE read: the stored document with the highest draw_number."""
         docs = list(
             self.results_collection()
             .order_by("draw_number", direction=firestore.Query.DESCENDING)
@@ -117,38 +118,37 @@ class SubaDawasakScraper:
         if not docs:
             return None
 
-        latest = docs[0].to_dict().get("draw_number")
+        data = docs[0].to_dict() or {}
+        self._learn_url_style(data.get("url"))
+
+        latest = data.get("draw_number")
         if isinstance(latest, int):
-            self.meta_ref().set({
-                "latest_draw_number": latest,
-                "meta_updated_at": datetime.now(timezone.utc).isoformat(),
-            }, merge=True)
             return latest
-        return None
-
-    def upload_to_firestore(self, result: Dict) -> bool:
-        """Result doc + meta update in ONE atomic batch (2 writes)."""
-        draw_number = result["draw_number"]
-        doc_id = f"suba-dawasak_{result['draw_number_str']}"
-
         try:
-            batch = self.db.batch()
-            batch.set(self.results_collection().document(doc_id), result, merge=True)
+            return int(latest)
+        except (TypeError, ValueError):
+            return None
 
-            if self.latest_known is None or draw_number > self.latest_known:
-                batch.set(self.meta_ref(), {
-                    "latest_draw_number": draw_number,
-                    "latest_draw_date": result.get("date_iso") or result.get("date"),
-                    "meta_updated_at": datetime.now(timezone.utc).isoformat(),
-                }, merge=True)
+    def _learn_url_style(self, url: Optional[str]):
+        """Remember host + padded/unpadded style from the latest stored URL."""
+        if not url or f"/results/{self.LOTTERY_SLUG}/" not in url:
+            return
+        base, _, last = url.rstrip("/").rpartition("/")
+        if not last.isdigit():
+            return
+        self.url_base = base
+        self.url_padded = len(last) >= 4 and last.startswith("0")
 
-            batch.commit()
-
-            if self.latest_known is None or draw_number > self.latest_known:
-                self.latest_known = draw_number
-
+    def upload_new_result(self, result: Dict) -> bool:
+        """create() = 1 write, fails if the document already exists."""
+        doc_id = f"suba-dawasak_{result['draw_number_str']}"
+        try:
+            self.results_collection().document(doc_id).create(result)
             print(f"   ☁️ Uploaded: {doc_id}")
             return True
+        except AlreadyExists:
+            print(f"   ℹ️ {doc_id} already exists — left unchanged.")
+            return False
         except Exception as e:
             print(f"   ❌ Firestore upload failed: {e}")
             return False
@@ -157,7 +157,6 @@ class SubaDawasakScraper:
     # FETCHING (cheap HTTP first, Chrome only when needed)
     # ------------------------------------------------------------
     def fetch_with_requests(self, url: str) -> Tuple[Optional[str], Optional[int]]:
-        """Returns (html_or_None, http_status_or_None)."""
         for attempt in (1, 2):
             try:
                 resp = self.session.get(url, timeout=self.HTTP_TIMEOUT, allow_redirects=True)
@@ -173,7 +172,6 @@ class SubaDawasakScraper:
     def init_selenium(self):
         if self.driver:
             return self.driver
-
         try:
             from selenium import webdriver
             from selenium.webdriver.chrome.options import Options
@@ -192,13 +190,6 @@ class SubaDawasakScraper:
 
             self.driver = webdriver.Chrome(options=options)
             self.driver.set_page_load_timeout(45)
-            try:
-                self.driver.execute_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                )
-            except Exception:
-                pass
-
             print("✅ Selenium Chrome initialized.")
             return self.driver
         except Exception as e:
@@ -206,21 +197,23 @@ class SubaDawasakScraper:
             return None
 
     def fetch_with_selenium(self, url: str) -> Optional[str]:
+        if self.selenium_fetches >= self.max_selenium_fetches:
+            print("   ⏭️ Chrome fetch limit for this run reached.")
+            return None
+
         driver = self.init_selenium()
         if not driver:
             return None
 
-        for attempt in range(1, self.SELENIUM_ATTEMPTS + 1):
-            try:
-                driver.get(url)
-                time.sleep(self.PAGE_WAIT)
-                html = driver.page_source
-                if len(html) > 2000 and "draw" in html.lower():
-                    return html
-            except Exception as e:
-                print(f"   ⚠️ Selenium error: {e}")
-            if attempt < self.SELENIUM_ATTEMPTS:
-                time.sleep(attempt * 2)
+        self.selenium_fetches += 1
+        try:
+            driver.get(url)
+            time.sleep(self.PAGE_WAIT)
+            html = driver.page_source
+            if len(html) > 2000 and "draw" in html.lower():
+                return html
+        except Exception as e:
+            print(f"   ⚠️ Selenium error: {e}")
         return None
 
     # ------------------------------------------------------------
@@ -238,62 +231,62 @@ class SubaDawasakScraper:
         return self.normalize_text(soup.get_text(separator=" ", strip=True))
 
     # ------------------------------------------------------------
-    # DATE
+    # DATE (identical logic to your working backfill script)
     # ------------------------------------------------------------
-    DATE_PATTERNS = [
-        r"((?:January|February|March|April|May|June|July|August|"
-        r"September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|"
-        r"Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})",
-        r"(?<!\d)(\d{4}[/-]\d{1,2}[/-]\d{1,2})(?!\d)",
-        r"(?<!\d)(\d{1,2}[/-]\d{1,2}[/-]\d{4})(?!\d)",
-    ]
-
-    def extract_date(self, text: str, anchor: Optional[int] = None) -> Optional[str]:
-        """
-        1) An explicit "Draw Date: ..." label wins.
-        2) Otherwise collect every date on the page and pick the one closest
-           to the result itself (anchor), so header/footer/"today" dates
-           elsewhere on the page are not picked by mistake.
-        """
-        labeled = re.search(
-            r"Draw\s+Date\s*:?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
-            text, re.IGNORECASE,
+    def extract_date(self, text: str) -> Optional[str]:
+        month = (
+            r"(?:January|February|March|April|May|June|July|August|"
+            r"September|October|November|December|Jan|Feb|Mar|Apr|May|"
+            r"Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
         )
-        if labeled:
-            return labeled.group(1)
+        date_value = (
+            rf"(?:"
+            rf"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+)?"
+            rf"(?:{month}\.?\s+\d{{1,2}},?\s+\d{{4}}"
+            rf"|\d{{4}}[/-]\d{{1,2}}[/-]\d{{1,2}}"
+            rf"|\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{4}}"
+            rf")"
+        )
+        patterns = [
+            rf"\bDraw\s*Date\b\s*[:\-]?\s*({date_value})",
+            rf"\bDate\b\s*[:\-]?\s*({date_value})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                parsed = self._parse_date_value(match.group(1))
+                if parsed:
+                    # Portable "November 3, 2026" (no %-d, works on any OS).
+                    return f"{parsed.strftime('%B')} {parsed.day}, {parsed.year}"
+        return None
 
-        candidates = []
-        for pattern in self.DATE_PATTERNS:
-            for m in re.finditer(pattern, text, re.IGNORECASE):
-                candidates.append((m.start(), m.group(1)))
-
-        if not candidates:
-            return None
-
-        if self.debug:
-            print(f"   🗓️ Date candidates: {candidates[:8]}")
-
-        if anchor is None:
-            return min(candidates, key=lambda c: c[0])[1]
-
-        return min(candidates, key=lambda c: abs(c[0] - anchor))[1]
-
-    def parse_date(self, date_string: Optional[str]) -> Optional[str]:
+    @staticmethod
+    def _parse_date_value(date_string: Optional[str]) -> Optional[datetime]:
         if not date_string:
             return None
-        cleaned = date_string.strip().replace("Sept", "Sep").replace(".", "")
+        cleaned = re.sub(r"\s+", " ", date_string.strip())
+        cleaned = re.sub(
+            r"^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+",
+            "", cleaned, flags=re.IGNORECASE,
+        )
+        cleaned = cleaned.replace("Sept", "Sep").replace(".", "")
         for fmt in (
             "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y",
-            "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%Y-%m-%d",
+            "%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y",
+            "%m/%d/%Y", "%m-%d-%Y",
         ):
             try:
-                return datetime.strptime(cleaned, fmt).isoformat()
+                return datetime.strptime(cleaned, fmt)
             except ValueError:
                 continue
-        return date_string
+        return None
+
+    def parse_date(self, date_string: Optional[str]) -> Optional[str]:
+        parsed = self._parse_date_value(date_string)
+        return parsed.strftime("%Y-%m-%dT00:00:00") if parsed else None
 
     # ------------------------------------------------------------
-    # RESULT PARSING (promotional draw is optional)
+    # RESULT PARSING (promotional draw optional)
     # ------------------------------------------------------------
     def _zodiac_regex(self) -> str:
         signs = sorted(self.ZODIAC_SIGNS, key=len, reverse=True)
@@ -355,9 +348,7 @@ class SubaDawasakScraper:
     # ------------------------------------------------------------
     def try_parse(self, html: str, url: str, draw_number: int) -> Tuple[Optional[Dict], str]:
         text = self.get_page_text(html)
-        if len(text) < 300:
-            return None, text
-        if not self.page_mentions_draw(text, draw_number):
+        if len(text) < 300 or not self.page_mentions_draw(text, draw_number):
             return None, text
 
         main_result = self.extract_main_result(text)
@@ -365,8 +356,14 @@ class SubaDawasakScraper:
             return None, text
 
         draw_padded = f"{draw_number:04d}"
-        zodiac_hit = re.search(self._zodiac_regex(), text, re.IGNORECASE)
-        date = self.extract_date(text, zodiac_hit.start() if zodiac_hit else None)
+        date = self.extract_date(text)
+        date_iso = self.parse_date(date)
+
+        # Never store a guessed/unrelated date.
+        if not date or not date_iso:
+            print(f"   ⚠️ Draw {draw_padded}: explicit draw date not found; not uploading.")
+            return None, text
+
         promotional = self.extract_promotional_draw(text)
 
         result = {
@@ -375,7 +372,7 @@ class SubaDawasakScraper:
             "draw_number": draw_number,
             "draw_number_str": draw_padded,
             "date": date,
-            "date_iso": self.parse_date(date),
+            "date_iso": date_iso,
             "main_result": main_result,
             "has_promotional_draw": promotional is not None,
             "url": url,
@@ -386,23 +383,30 @@ class SubaDawasakScraper:
             result["promotional_draw"] = promotional
         return result, text
 
+    def candidate_urls(self, draw_number: int) -> List[str]:
+        padded = f"{draw_number:04d}"
+        plain = str(draw_number)
+
+        # Normal case: exactly one URL, in the style the latest doc used.
+        if self.url_base and not self.all_url_variants:
+            return [f"{self.url_base}/{padded if self.url_padded else plain}"]
+
+        urls = []
+        for base in self.BASE_URLS:
+            for value in (padded, plain):
+                urls.append(f"{base}/results/{self.LOTTERY_SLUG}/{value}")
+        return list(dict.fromkeys(urls))
+
     def scrape_draw(self, draw_number: int) -> Optional[Dict]:
         draw_padded = f"{draw_number:04d}"
         print(f"\n🔎 Checking draw {draw_padded}...")
 
-        urls = []
-        for base in self.BASE_URLS:
-            for value in (draw_padded, str(draw_number)):
-                urls.append(f"{base}/results/{self.LOTTERY_SLUG}/{value}")
-        urls = list(dict.fromkeys(urls))
-
         last_text = ""
 
-        for url in urls:
+        for url in self.candidate_urls(draw_number):
             html, status = self.fetch_with_requests(url)
 
-            # Clean 404 = not published. No need to start Chrome.
-            if status == 404:
+            if status == 404:          # clean "not published" — skip Chrome
                 continue
 
             if html:
@@ -411,7 +415,6 @@ class SubaDawasakScraper:
                 if result:
                     return self._found(result, draw_padded)
 
-            # Blocked / empty / unparsable over plain HTTP -> try Chrome.
             html = self.fetch_with_selenium(url)
             if html:
                 result, text = self.try_parse(html, url, draw_number)
@@ -421,8 +424,8 @@ class SubaDawasakScraper:
 
         print(f"   ⛔ Draw {draw_padded} not available (or could not be parsed).")
         if self.debug and last_text:
-            print("   --- DEBUG page text (first 1500 chars) ---")
-            print(last_text[:1500])
+            print("   --- DEBUG page text (first 3000 chars) ---")
+            print(last_text[:3000])
             print("   --- END DEBUG ---")
         return None
 
@@ -431,65 +434,44 @@ class SubaDawasakScraper:
         main = result["main_result"]
         note = "+promo" if result["has_promotional_draw"] else "no promo"
         print(f"   ✅ Found draw {draw_padded}: {main['zodiac']} "
-              f"{'-'.join(main['numbers'])} ({note}) date={result.get('date')}")
+              f"{'-'.join(main['numbers'])} ({note}) date={result['date']}")
         return result
 
     # ------------------------------------------------------------
     # INCREMENTAL UPDATE
     # ------------------------------------------------------------
-    def find_and_upload_new_draws(
-        self,
-        start_draw_fallback: int,
-        max_consecutive_misses: int,
-        max_new_draws: int,
-        delay: float,
-    ) -> int:
-        self.latest_known = self.get_latest_draw_number()
+    def run(self, start_fallback: int, max_misses: int, max_new: int) -> int:
+        latest = self.get_latest_draw_number()
 
-        if self.latest_known is None:
-            print(f"📭 No existing results. Starting from {start_draw_fallback:04d}.")
-            next_draw = start_draw_fallback
+        if latest is None:
+            print(f"📭 No results stored. Starting from {start_fallback:04d}.")
+            next_draw = start_fallback
         else:
-            print(f"📌 Latest draw already in Firestore: {self.latest_known:04d}")
-            next_draw = self.latest_known + 1
+            print(f"📌 Latest draw in Firestore: {latest:04d}")
+            next_draw = latest + 1
 
-        new_uploaded = 0
+        uploaded = 0
         misses = 0
         attempts = 0
 
-        while misses < max_consecutive_misses and attempts < max_new_draws:
+        while misses < max_misses and attempts < max_new:
             attempts += 1
             result = self.scrape_draw(next_draw)
 
             if result:
-                if self.upload_to_firestore(result):
-                    new_uploaded += 1
+                if self.upload_new_result(result):
+                    uploaded += 1
                 misses = 0
             else:
                 misses += 1
 
             next_draw += 1
-            if misses < max_consecutive_misses:
-                time.sleep(delay)
 
-        if new_uploaded == 0:
-            print("\n✅ No new draws found — already up to date.")
+        if uploaded == 0:
+            print("\n✅ No new draws — already up to date.")
         else:
-            print(f"\n🎉 Uploaded {new_uploaded} new draw(s).")
-        return new_uploaded
-
-    def repair_range(self, first: int, last: int, delay: float) -> int:
-        """Re-scrape draws first..last and overwrite their stored fields
-        (used to fix wrong dates). Costs 1 read + 2 writes per draw."""
-        self.latest_known = self.get_latest_draw_number()
-        fixed = 0
-        for n in range(first, last + 1):
-            result = self.scrape_draw(n)
-            if result and self.upload_to_firestore(result):
-                fixed += 1
-            time.sleep(delay)
-        print(f"\n🛠️ Repaired {fixed} draw(s) in {first:04d}-{last:04d}.")
-        return fixed
+            print(f"\n🎉 Uploaded {uploaded} new draw(s).")
+        return uploaded
 
     def close(self):
         if self.driver:
@@ -502,35 +484,31 @@ class SubaDawasakScraper:
 
 
 def main():
-    creds_path = os.environ.get("FIREBASE_CREDENTIALS", "serviceAccountKey.json")
-    start_draw_fallback = int(os.environ.get("START_DRAW_FALLBACK", "1"))
-    max_consecutive_misses = int(os.environ.get("MAX_CONSECUTIVE_MISSES", "2"))
-    max_new_draws = int(os.environ.get("MAX_NEW_DRAWS_PER_RUN", "60"))
-    delay = float(os.environ.get("DRAW_DELAY_SECONDS", "1.0"))
-    debug = os.environ.get("DEBUG", "0") == "1"
-
+    creds_path = (
+        os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        or os.environ.get("FIREBASE_CREDENTIALS")
+        or "serviceAccountKey.json"
+    )
     if not os.path.exists(creds_path):
         print(f"❌ Credentials file not found: {creds_path}")
         raise SystemExit(1)
 
-    scraper = None
+    updater = None
     try:
-        scraper = SubaDawasakScraper(creds_path, debug=debug)
-        repair_from = os.environ.get("443")
-        repair_to = os.environ.get("476")
-
-        if repair_from and repair_to:
-            scraper.repair_range(int(repair_from), int(repair_to), delay)
-        else:
-            scraper.find_and_upload_new_draws(
-                start_draw_fallback=start_draw_fallback,
-                max_consecutive_misses=max_consecutive_misses,
-                max_new_draws=max_new_draws,
-                delay=delay,
-            )
+        updater = SubaDawasakUpdater(
+            creds_path,
+            debug=os.environ.get("DEBUG", "0") == "1",
+            max_selenium_fetches=int(os.environ.get("MAX_SELENIUM_FETCHES", "3")),
+            all_url_variants=os.environ.get("ALL_URL_VARIANTS", "0") == "1",
+        )
+        updater.run(
+            start_fallback=int(os.environ.get("START_DRAW_FALLBACK", "1")),
+            max_misses=int(os.environ.get("MAX_CONSECUTIVE_MISSES", "2")),
+            max_new=int(os.environ.get("MAX_NEW_DRAWS_PER_RUN", "20")),
+        )
     finally:
-        if scraper:
-            scraper.close()
+        if updater:
+            updater.close()
 
 
 if __name__ == "__main__":
