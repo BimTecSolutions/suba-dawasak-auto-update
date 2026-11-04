@@ -1,35 +1,31 @@
 """
-Suba Dawasak — incremental Firestore updater.
+Suba Dawasak — incremental Firestore updater (robust version).
 
-Unlike the original range-based scraper, this script:
-  1. Asks Firestore what the latest draw number already stored is.
-  2. Tries draw numbers after that one, one by one, against the NLB site.
-  3. Uploads every new draw it finds, and stops once it hits a run of
-     consecutive misses (meaning it has caught up to "not published yet").
-
-Designed to run unattended (e.g. a GitHub Actions cron job every 5 minutes),
-so there are NO input() prompts — everything is controlled by environment
-variables, with sensible defaults.
+What changed vs the old version:
+  * The main result (zodiac + 3 numbers) no longer REQUIRES the words
+    "Promotional Draw" to be on the page. The promotional draw is now
+    optional, so draws after 0442 (which have none) are parsed correctly.
+  * Parsing uses several fallback strategies instead of one strict regex.
+  * The page is checked to really be the requested draw (so a redirect to
+    another draw's page is never saved under the wrong number).
+  * On a parse failure, the page text is printed (DEBUG=1) so you can see
+    exactly why in the GitHub Actions log.
+  * Defaults allow catching up on a big backlog (0443 -> 0476) in one run.
 
 Environment variables:
-  FIREBASE_CREDENTIALS        Path to the service account JSON file.
-                               Default: serviceAccountKey.json
-  START_DRAW_FALLBACK         Draw number to start from if Firestore has
-                               no results yet at all. Default: 1
-  MAX_CONSECUTIVE_MISSES      How many draw numbers in a row can fail to
-                               resolve before we assume we've caught up
-                               and stop. Default: 3
-  MAX_NEW_DRAWS_PER_RUN       Safety cap on how many new draws a single
-                               run will attempt, so a bad loop can't hammer
-                               the site or run forever. Default: 20
-  DRAW_DELAY_SECONDS          Delay between draw attempts. Default: 1.0
+  FIREBASE_CREDENTIALS     Path to service account JSON. Default: serviceAccountKey.json
+  START_DRAW_FALLBACK      Start draw if Firestore is empty. Default: 1
+  MAX_CONSECUTIVE_MISSES   Stop after this many misses in a row. Default: 4
+  MAX_NEW_DRAWS_PER_RUN    Safety cap per run. Default: 60
+  DRAW_DELAY_SECONDS       Delay between draws. Default: 1.0
+  DEBUG                    Set to 1 to print page text when parsing fails.
 """
 
 import os
 import re
 import time
 from datetime import datetime
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 import requests
 from bs4 import BeautifulSoup
@@ -51,18 +47,19 @@ class SubaDawasakScraper:
     FIRESTORE_DOCUMENT = "suba-dawasak"
     FIRESTORE_SUBCOLLECTION = "results"
 
-    MAX_REQUEST_RETRIES = 3
+    MAX_REQUEST_RETRIES = 2
     PAGE_WAIT = 4
 
-    ZODIAC_SIGNS = {
+    ZODIAC_SIGNS = [
         "ARIES", "TAURUS", "GEMINI", "CANCER", "LEO", "VIRGO",
         "LIBRA", "SCORPIO", "SAGITTARIUS", "CAPRICORN",
         "AQUARIUS", "PISCES",
-    }
+    ]
 
-    def __init__(self, firebase_creds_path: str):
+    def __init__(self, firebase_creds_path: str, debug: bool = False):
         self.db = None
         self.driver = None
+        self.debug = debug
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -102,24 +99,18 @@ class SubaDawasakScraper:
         )
 
     def get_latest_draw_number(self) -> Optional[int]:
-        """Return the highest draw_number currently stored, or None if empty."""
         query = (
             self.get_results_collection()
             .order_by("draw_number", direction=firestore.Query.DESCENDING)
             .limit(1)
         )
-
         docs = list(query.stream())
-
         if not docs:
             return None
-
         return docs[0].to_dict().get("draw_number")
 
     def upload_to_firestore(self, result: Dict) -> bool:
-        draw_str = result["draw_number_str"]
-        document_id = f"suba-dawasak_{draw_str}"
-
+        document_id = f"suba-dawasak_{result['draw_number_str']}"
         try:
             self.get_results_collection().document(document_id).set(
                 result, merge=True
@@ -131,7 +122,7 @@ class SubaDawasakScraper:
             return False
 
     # ------------------------------------------------------------
-    # SELENIUM
+    # SELENIUM / REQUESTS
     # ------------------------------------------------------------
     def init_selenium(self):
         if self.driver:
@@ -154,6 +145,7 @@ class SubaDawasakScraper:
             options.add_experimental_option("useAutomationExtension", False)
 
             self.driver = webdriver.Chrome(options=options)
+            self.driver.set_page_load_timeout(45)
 
             try:
                 self.driver.execute_script(
@@ -178,20 +170,10 @@ class SubaDawasakScraper:
             try:
                 driver.get(url)
                 time.sleep(self.PAGE_WAIT)
-
                 html = driver.page_source
-                try:
-                    body_text = driver.find_element("tag name", "body").text
-                except Exception:
-                    body_text = ""
 
-                combined = (html + " " + body_text).lower()
-                indicators = ["suba dawasak", "promotional draw", "draw", "results"]
-                found = sum(x in combined for x in indicators)
-
-                if len(html) > 2000 and found >= 1:
+                if len(html) > 2000 and "draw" in html.lower():
                     return html
-
             except Exception as e:
                 print(f"   ⚠️ Selenium error: {e}")
 
@@ -242,9 +224,11 @@ class SubaDawasakScraper:
         patterns = [
             r"Draw\s+Date\s*:?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
             r"Date\s*:?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
-            r"([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
-            r"(\d{1,2}[/-]\d{1,2}[/-]\d{4})",
             r"(\d{4}[/-]\d{1,2}[/-]\d{1,2})",
+            r"(\d{1,2}[/-]\d{1,2}[/-]\d{4})",
+            r"((?:January|February|March|April|May|June|July|August|"
+            r"September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|"
+            r"Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})",
         ]
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
@@ -256,13 +240,14 @@ class SubaDawasakScraper:
         if not date_string:
             return None
 
+        cleaned = date_string.strip().replace("Sept", "Sep").replace(".", "")
         formats = [
             "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y",
             "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%Y-%m-%d",
         ]
         for fmt in formats:
             try:
-                return datetime.strptime(date_string.strip(), fmt).isoformat()
+                return datetime.strptime(cleaned, fmt).isoformat()
             except ValueError:
                 continue
         return date_string
@@ -271,71 +256,75 @@ class SubaDawasakScraper:
     # RESULT PARSING
     # ------------------------------------------------------------
     def _zodiac_regex(self) -> str:
-        return r"\b(" + "|".join(sorted(self.ZODIAC_SIGNS, key=len, reverse=True)) + r")\b"
+        signs = sorted(self.ZODIAC_SIGNS, key=len, reverse=True)
+        return r"\b(" + "|".join(signs) + r")\b"
+
+    @staticmethod
+    def _pack_main(zodiac: str, raw_numbers: List[str]) -> Dict:
+        numbers = [f"{int(x):02d}" for x in raw_numbers]
+        return {
+            "zodiac": zodiac.upper(),
+            "numbers": numbers,
+            "numbers_int": [int(x) for x in numbers],
+        }
 
     def extract_main_result(self, text: str) -> Optional[Dict]:
+        """
+        Zodiac sign followed by three numbers. The "Promotional Draw"
+        label is NOT required (draws after 0442 don't have one).
+        """
         zodiac_regex = self._zodiac_regex()
 
-        pattern = (
-            zodiac_regex
-            + r"\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})"
-            r"\s+(?:More\s+)?Promotional\s+Draw"
+        # Strategy 1: zodiac immediately followed by three 1-2 digit numbers.
+        strict = re.compile(
+            zodiac_regex + r"\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})(?!\d)",
+            re.IGNORECASE,
         )
+        match = strict.search(text)
+        if match:
+            return self._pack_main(
+                match.group(1), [match.group(2), match.group(3), match.group(4)]
+            )
 
-        matches = list(re.finditer(pattern, text, re.IGNORECASE))
+        # Strategy 2: zodiac followed (within a short window) by 3 numbers,
+        # allowing separators like "-", ",", "|" or small words between them.
+        for zm in re.finditer(zodiac_regex, text, re.IGNORECASE):
+            window = text[zm.end(): zm.end() + 80]
+            nums = re.findall(r"(?<!\d)(\d{1,2})(?!\d)", window)
+            if len(nums) >= 3:
+                return self._pack_main(zm.group(1), nums[:3])
 
-        if matches:
-            match = matches[0]
-            zodiac = match.group(1).upper()
-            raw_numbers = [match.group(2), match.group(3), match.group(4)]
-            numbers = [f"{int(x):02d}" for x in raw_numbers]
-
-            return {
-                "zodiac": zodiac,
-                "numbers": numbers,
-                "numbers_int": [int(x) for x in numbers],
-            }
-
-        promo_matches = list(re.finditer(r"Promotional\s+Draw", text, re.IGNORECASE))
-
-        for promo in promo_matches:
-            before = text[max(0, promo.start() - 300):promo.start()]
-            zodiac_matches = list(re.finditer(zodiac_regex, before, re.IGNORECASE))
-
-            if not zodiac_matches:
+        # Strategy 3 (old behaviour): numbers BEFORE a "Promotional Draw" label.
+        for promo in re.finditer(r"Promotional\s+Draw", text, re.IGNORECASE):
+            before = text[max(0, promo.start() - 300): promo.start()]
+            zodiacs = list(re.finditer(zodiac_regex, before, re.IGNORECASE))
+            if not zodiacs:
                 continue
-
-            zodiac_match = zodiac_matches[-1]
-            after_zodiac = before[zodiac_match.end():]
-            number_matches = re.findall(r"(?<!\d)(\d{1,2})(?!\d)", after_zodiac)
-
-            if len(number_matches) >= 3:
-                raw_numbers = number_matches[-3:]
-                numbers = [f"{int(x):02d}" for x in raw_numbers]
-
-                return {
-                    "zodiac": zodiac_match.group(1).upper(),
-                    "numbers": numbers,
-                    "numbers_int": [int(x) for x in numbers],
-                }
+            zm = zodiacs[-1]
+            nums = re.findall(r"(?<!\d)(\d{1,2})(?!\d)", before[zm.end():])
+            if len(nums) >= 3:
+                return self._pack_main(zm.group(1), nums[-3:])
 
         return None
 
     def extract_promotional_draw(self, text: str) -> Optional[Dict]:
-        matches = list(re.finditer(r"Promotional\s+Draw", text, re.IGNORECASE))
-
-        for promo_match in matches:
-            section = text[promo_match.end():promo_match.end() + 150]
+        """Optional. Returns None when the draw has no promotional part."""
+        for promo in re.finditer(r"Promotional\s+Draw", text, re.IGNORECASE):
+            section = text[promo.end(): promo.end() + 150]
             digits = re.findall(r"(?<!\d)([0-9])(?!\d)", section)
-
             if len(digits) >= 4:
                 digits = digits[:4]
                 return {
                     "numbers": digits,
                     "numbers_int": [int(x) for x in digits],
                 }
-
         return None
+
+    @staticmethod
+    def page_mentions_draw(text: str, draw_number: int) -> bool:
+        """Guard against redirects to another draw's page."""
+        pattern = rf"(?<!\d)0*{draw_number}(?!\d)"
+        return re.search(pattern, text) is not None
 
     # ------------------------------------------------------------
     # SCRAPE ONE DRAW
@@ -344,13 +333,14 @@ class SubaDawasakScraper:
         draw_padded = f"{draw_number:04d}"
         print(f"\n🔎 Checking draw {draw_padded}...")
 
-        number_variations = [str(draw_number), draw_padded]
         urls = []
         for base_url in self.BASE_URLS:
-            for number_value in number_variations:
+            for number_value in (draw_padded, str(draw_number)):
                 urls.append(f"{base_url}/results/{self.LOTTERY_SLUG}/{number_value}")
                 urls.append(f"{base_url}/results/{self.LOTTERY_SLUG}/{number_value}/")
         urls = list(dict.fromkeys(urls))
+
+        last_text = ""
 
         for url in urls:
             html = self.fetch_page(url)
@@ -360,12 +350,17 @@ class SubaDawasakScraper:
             text = self.get_page_text(html)
             if len(text) < 300:
                 continue
+            last_text = text
 
-            date = self.extract_date(text)
+            if not self.page_mentions_draw(text, draw_number):
+                print(f"   ↪️ {url} does not look like draw {draw_padded}, skipping.")
+                continue
+
             main_result = self.extract_main_result(text)
             if not main_result:
                 continue
 
+            date = self.extract_date(text)
             promotional = self.extract_promotional_draw(text)
 
             result = {
@@ -376,6 +371,7 @@ class SubaDawasakScraper:
                 "date": date,
                 "date_iso": self.parse_date(date),
                 "main_result": main_result,
+                "has_promotional_draw": promotional is not None,
                 "url": url,
                 "scraped_at": datetime.now().isoformat(),
                 "source": "National Lotteries Board, Sri Lanka",
@@ -384,12 +380,16 @@ class SubaDawasakScraper:
             if promotional:
                 result["promotional_draw"] = promotional
 
+            promo_note = " (+promo)" if promotional else " (no promo)"
             print(f"   ✅ Found draw {draw_padded}: {main_result['zodiac']} "
-                  f"{'-'.join(main_result['numbers'])}")
-
+                  f"{'-'.join(main_result['numbers'])}{promo_note}")
             return result
 
-        print(f"   ⛔ Draw {draw_padded} not available yet.")
+        print(f"   ⛔ Draw {draw_padded} not available (or could not be parsed).")
+        if self.debug and last_text:
+            print("   --- DEBUG page text (first 1500 chars) ---")
+            print(last_text[:1500])
+            print("   --- END DEBUG ---")
         return None
 
     # ------------------------------------------------------------
@@ -416,10 +416,7 @@ class SubaDawasakScraper:
         consecutive_misses = 0
         attempts = 0
 
-        while (
-            consecutive_misses < max_consecutive_misses
-            and attempts < max_new_draws
-        ):
+        while consecutive_misses < max_consecutive_misses and attempts < max_new_draws:
             attempts += 1
             result = self.scrape_draw(next_draw)
 
@@ -440,9 +437,6 @@ class SubaDawasakScraper:
 
         return new_uploaded
 
-    # ------------------------------------------------------------
-    # CLOSE
-    # ------------------------------------------------------------
     def close(self):
         if self.driver:
             try:
@@ -456,18 +450,18 @@ class SubaDawasakScraper:
 def main():
     creds_path = os.environ.get("FIREBASE_CREDENTIALS", "serviceAccountKey.json")
     start_draw_fallback = int(os.environ.get("START_DRAW_FALLBACK", "1"))
-    max_consecutive_misses = int(os.environ.get("MAX_CONSECUTIVE_MISSES", "3"))
-    max_new_draws = int(os.environ.get("MAX_NEW_DRAWS_PER_RUN", "20"))
+    max_consecutive_misses = int(os.environ.get("MAX_CONSECUTIVE_MISSES", "4"))
+    max_new_draws = int(os.environ.get("MAX_NEW_DRAWS_PER_RUN", "60"))
     delay = float(os.environ.get("DRAW_DELAY_SECONDS", "1.0"))
+    debug = os.environ.get("DEBUG", "0") == "1"
 
     if not os.path.exists(creds_path):
         print(f"❌ Credentials file not found: {creds_path}")
         raise SystemExit(1)
 
     scraper = None
-
     try:
-        scraper = SubaDawasakScraper(creds_path)
+        scraper = SubaDawasakScraper(creds_path, debug=debug)
         scraper.find_and_upload_new_draws(
             start_draw_fallback=start_draw_fallback,
             max_consecutive_misses=max_consecutive_misses,
