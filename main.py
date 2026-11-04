@@ -240,21 +240,43 @@ class SubaDawasakScraper:
     # ------------------------------------------------------------
     # DATE
     # ------------------------------------------------------------
-    def extract_date(self, text: str) -> Optional[str]:
-        patterns = [
+    DATE_PATTERNS = [
+        r"((?:January|February|March|April|May|June|July|August|"
+        r"September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|"
+        r"Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})",
+        r"(?<!\d)(\d{4}[/-]\d{1,2}[/-]\d{1,2})(?!\d)",
+        r"(?<!\d)(\d{1,2}[/-]\d{1,2}[/-]\d{4})(?!\d)",
+    ]
+
+    def extract_date(self, text: str, anchor: Optional[int] = None) -> Optional[str]:
+        """
+        1) An explicit "Draw Date: ..." label wins.
+        2) Otherwise collect every date on the page and pick the one closest
+           to the result itself (anchor), so header/footer/"today" dates
+           elsewhere on the page are not picked by mistake.
+        """
+        labeled = re.search(
             r"Draw\s+Date\s*:?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
-            r"Date\s*:?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
-            r"(\d{4}[/-]\d{1,2}[/-]\d{1,2})",
-            r"(\d{1,2}[/-]\d{1,2}[/-]\d{4})",
-            r"((?:January|February|March|April|May|June|July|August|"
-            r"September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|"
-            r"Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return match.group(1)
-        return None
+            text, re.IGNORECASE,
+        )
+        if labeled:
+            return labeled.group(1)
+
+        candidates = []
+        for pattern in self.DATE_PATTERNS:
+            for m in re.finditer(pattern, text, re.IGNORECASE):
+                candidates.append((m.start(), m.group(1)))
+
+        if not candidates:
+            return None
+
+        if self.debug:
+            print(f"   🗓️ Date candidates: {candidates[:8]}")
+
+        if anchor is None:
+            return min(candidates, key=lambda c: c[0])[1]
+
+        return min(candidates, key=lambda c: abs(c[0] - anchor))[1]
 
     def parse_date(self, date_string: Optional[str]) -> Optional[str]:
         if not date_string:
@@ -343,7 +365,8 @@ class SubaDawasakScraper:
             return None, text
 
         draw_padded = f"{draw_number:04d}"
-        date = self.extract_date(text)
+        zodiac_hit = re.search(self._zodiac_regex(), text, re.IGNORECASE)
+        date = self.extract_date(text, zodiac_hit.start() if zodiac_hit else None)
         promotional = self.extract_promotional_draw(text)
 
         result = {
@@ -408,7 +431,7 @@ class SubaDawasakScraper:
         main = result["main_result"]
         note = "+promo" if result["has_promotional_draw"] else "no promo"
         print(f"   ✅ Found draw {draw_padded}: {main['zodiac']} "
-              f"{'-'.join(main['numbers'])} ({note})")
+              f"{'-'.join(main['numbers'])} ({note}) date={result.get('date')}")
         return result
 
     # ------------------------------------------------------------
@@ -455,6 +478,19 @@ class SubaDawasakScraper:
             print(f"\n🎉 Uploaded {new_uploaded} new draw(s).")
         return new_uploaded
 
+    def repair_range(self, first: int, last: int, delay: float) -> int:
+        """Re-scrape draws first..last and overwrite their stored fields
+        (used to fix wrong dates). Costs 1 read + 2 writes per draw."""
+        self.latest_known = self.get_latest_draw_number()
+        fixed = 0
+        for n in range(first, last + 1):
+            result = self.scrape_draw(n)
+            if result and self.upload_to_firestore(result):
+                fixed += 1
+            time.sleep(delay)
+        print(f"\n🛠️ Repaired {fixed} draw(s) in {first:04d}-{last:04d}.")
+        return fixed
+
     def close(self):
         if self.driver:
             try:
@@ -480,12 +516,18 @@ def main():
     scraper = None
     try:
         scraper = SubaDawasakScraper(creds_path, debug=debug)
-        scraper.find_and_upload_new_draws(
-            start_draw_fallback=start_draw_fallback,
-            max_consecutive_misses=max_consecutive_misses,
-            max_new_draws=max_new_draws,
-            delay=delay,
-        )
+        repair_from = os.environ.get("443")
+        repair_to = os.environ.get("476")
+
+        if repair_from and repair_to:
+            scraper.repair_range(int(repair_from), int(repair_to), delay)
+        else:
+            scraper.find_and_upload_new_draws(
+                start_draw_fallback=start_draw_fallback,
+                max_consecutive_misses=max_consecutive_misses,
+                max_new_draws=max_new_draws,
+                delay=delay,
+            )
     finally:
         if scraper:
             scraper.close()
