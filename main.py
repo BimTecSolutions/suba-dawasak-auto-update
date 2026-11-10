@@ -14,10 +14,6 @@ Efficiency:
     Chrome is capped at MAX_SELENIUM_FETCHES page loads per run.
   * Stops after MAX_CONSECUTIVE_MISSES unpublished draws in a row.
 
-Date/number parsing is the same as your working backfill script:
-the draw date is taken ONLY from an explicit "Date"/"Draw Date" label and
-stored like "November 3, 2026" (+ date_iso "2026-11-03T00:00:00").
-
 Environment variables (all optional):
   GOOGLE_APPLICATION_CREDENTIALS or FIREBASE_CREDENTIALS   service account JSON path
   START_DRAW_FALLBACK      first draw if Firestore is empty. Default: 1
@@ -231,33 +227,20 @@ class SubaDawasakUpdater:
         return self.normalize_text(soup.get_text(separator=" ", strip=True))
 
     # ------------------------------------------------------------
-    # DATE (identical logic to your working backfill script)
+    # DATE (same extract_date that worked in your backfill run)
     # ------------------------------------------------------------
     def extract_date(self, text: str) -> Optional[str]:
-        month = (
-            r"(?:January|February|March|April|May|June|July|August|"
-            r"September|October|November|December|Jan|Feb|Mar|Apr|May|"
-            r"Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
+        # Matches "Date: Tuesday September 01, 2026" (no comma after weekday)
+        m = re.search(
+            r"(?<![A-Za-z])Date\s*[:\-]\s*"
+            r"(?:(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day,?\s+)?"
+            r"([A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4})",
+            text,
         )
-        date_value = (
-            rf"(?:"
-            rf"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+)?"
-            rf"(?:{month}\.?\s+\d{{1,2}},?\s+\d{{4}}"
-            rf"|\d{{4}}[/-]\d{{1,2}}[/-]\d{{1,2}}"
-            rf"|\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{4}}"
-            rf")"
-        )
-        patterns = [
-            rf"\bDraw\s*Date\b\s*[:\-]?\s*({date_value})",
-            rf"\bDate\b\s*[:\-]?\s*({date_value})",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                parsed = self._parse_date_value(match.group(1))
-                if parsed:
-                    # Portable "November 3, 2026" (no %-d, works on any OS).
-                    return f"{parsed.strftime('%B')} {parsed.day}, {parsed.year}"
+        if m:
+            parsed = self._parse_date_value(m.group(1))
+            if parsed:
+                return f"{parsed.strftime('%B')} {parsed.day}, {parsed.year}"
         return None
 
     @staticmethod
@@ -269,7 +252,9 @@ class SubaDawasakUpdater:
             r"^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+",
             "", cleaned, flags=re.IGNORECASE,
         )
-        cleaned = cleaned.replace("Sept", "Sep").replace(".", "")
+        # FIX: only rewrite the standalone word "Sept". A plain
+        # .replace("Sept", "Sep") also corrupts "September" -> "Sepember".
+        cleaned = re.sub(r"\bSept\b", "Sep", cleaned).replace(".", "")
         for fmt in (
             "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y",
             "%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y",
